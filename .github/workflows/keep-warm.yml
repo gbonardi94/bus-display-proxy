@@ -1,0 +1,15 @@
+name: keep-render-warm
+
+on:
+  schedule:
+    - cron: '*/14 * * * *'
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping proxy su Render
+        run: |
+          code=$(curl -s -o /dev/null -w "%{http_code}" -m 30 https://bus-display-proxy.onrender.com/atm/12806)
+          echo "Render ha risposto: HTTP $code"
