@@ -14,7 +14,9 @@ import os, json, time, threading, math
 import websocket  # websocket-client
 
 ATM_HOME = "https://giromilano.atm.it/"
-ATM_URL  = "https://giromilano.atm.it/proxy.tpportal/proxy.ashx"
+# ATM ha dismesso il vecchio POST su /proxy.tpportal/proxy.ashx (ora risponde 403
+# Access Denied dal WAF). Il sito usa ora un endpoint REST in GET:
+ATM_API  = "https://giromilano.atm.it/proxy.tpportal/api/tpPortal/geodata/pois/stops/"
 PORT     = int(os.getenv('PORT', 8888))
 SESSION_TTL = 300  # rinnova il cookie ogni 5 minuti
 
@@ -40,15 +42,15 @@ def get_session(force=False):
         return _session
 
 
-def _do_post(s, stop_code):
-    return s.post(ATM_URL,
+def _do_get(s, stop_code):
+    """GET sull'endpoint REST attuale. Il JSON restituito ha la stessa struttura
+    di prima (Lines[] con BookletUrl2 / WaitMessage), quindi il parsing non cambia."""
+    return s.get(ATM_API + str(stop_code),
         headers={
-            'Content-Type': 'application/x-www-form-urlencoded;charset=utf-8',
             'Accept': 'application/json, text/plain, */*',
             'Accept-Language': 'it-IT,it;q=0.9',
             'Referer': 'https://giromilano.atm.it/',
         },
-        data=f'url=tpPortal%2Fgeodata%2Fpois%2Fstops%2F{stop_code}',
         timeout=15
     )
 
@@ -60,7 +62,7 @@ def fetch_atm(stop_code):
     for attempt in range(4):
         try:
             s = get_session(force=(attempt > 0))
-            r = _do_post(s, stop_code)
+            r = _do_get(s, stop_code)
             if r.status_code == 200:
                 return r.json()
             last_status = r.status_code
