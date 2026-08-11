@@ -10,7 +10,7 @@ Endpoint:
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from curl_cffi import requests as cf
 from urllib.parse import urlparse, parse_qs
-import os, json, time, threading, math, base64
+import os, json, time, threading, math, base64, re
 import websocket  # websocket-client
 from pyais import decode as ais_decode
 
@@ -374,8 +374,59 @@ def get_planes():
 # METAR cambia ~ogni 30 min).
 METAR_ICAO    = "LIEO"
 METAR_REFRESH = 300      # secondi (5 min)
+METAR_WRAP    = 16       # caratteri per riga remark (font piccolo sull'ESP)
 _metar_cache = None
 _metar_lock = threading.Lock()
+
+
+def _wrap_words(text, width):
+    """Spezza una stringa in righe da <= width caratteri, senza tagliare parole."""
+    lines, cur = [], ""
+    for w in text.split():
+        if not cur:
+            cur = w
+        elif len(cur) + 1 + len(w) <= width:
+            cur += " " + w
+        else:
+            lines.append(cur)
+            cur = w
+    if cur:
+        lines.append(cur)
+    return lines
+
+
+def _parse_metar(raw):
+    """Estrae vento/temp/qnh/remarks dal METAR grezzo. Ritorna un dict parziale;
+    i campi non trovati restano None e verra' usato il fallback dai campi JSON."""
+    toks = raw.split()
+    out = {"wind": None, "td": None, "qnh": None, "remarks": []}
+
+    for t in toks:
+        mo = re.match(r'^(\d{3}|VRB)(\d{2,3})(?:G(\d{2,3}))?KT$', t)
+        if mo:
+            d, sp, g = mo.group(1), mo.group(2), mo.group(3)
+            if d == "000" and sp == "00":
+                out["wind"] = "CALM"
+            else:
+                out["wind"] = f"{d}/{sp}" + (f"G{g}" if g else "")
+            break
+    for t in toks:
+        if re.match(r'^M?\d{2}/M?\d{2}$', t):
+            out["td"] = t
+            break
+    pidx = None
+    for i, t in enumerate(toks):
+        if re.match(r'^[QA]\d{4}$', t):
+            out["qnh"] = t
+            pidx = i
+    if pidx is not None:
+        trailing = toks[pidx + 1:]
+        if trailing and trailing[0] == "NOSIG":
+            trailing = trailing[1:]
+        rem = " ".join(trailing).strip()
+        if rem:
+            out["remarks"] = _wrap_words(rem, METAR_WRAP)
+    return out
 
 
 def _compute_metar():
@@ -391,14 +442,30 @@ def _compute_metar():
         m = data[0]
         report_time = m.get("reportTime", "")   # "2026-08-11T20:20:00.000Z"
         hhmm = report_time[11:16].replace(":", "") if len(report_time) >= 16 else "----"
+
+        p = _parse_metar(m.get("rawOb", ""))
+
+        # Fallback dai campi strutturati se il parsing grezzo non li ha trovati.
+        wind = p["wind"]
+        if wind is None:
+            wdir = m.get("wdir") if isinstance(m.get("wdir"), int) else 0
+            wspd = m.get("wspd") or 0
+            wind = "CALM" if wspd == 0 else f"{wdir:03d}/{wspd:02d}"
+        td = p["td"]
+        if td is None and m.get("temp") is not None and m.get("dewp") is not None:
+            td = f"{round(m['temp'])}/{round(m['dewp'])}"
+        qnh = p["qnh"]
+        if qnh is None and m.get("altim") is not None:
+            qnh = f"Q{round(m['altim'])}"
+
         return {
-            "icao": m.get("icaoId", METAR_ICAO),
             "time": f"{hhmm}z",
-            "wdir": m.get("wdir") if isinstance(m.get("wdir"), int) else 0,
-            "wspd": m.get("wspd") or 0,
-            "temp": round(m.get("temp")) if m.get("temp") is not None else 0,
-            "altim": round(m.get("altim")) if m.get("altim") is not None else 0,
-            "fltcat": m.get("fltCat") or "?",
+            "obs_epoch": m.get("obsTime") or 0,
+            "wind": wind or "----",
+            "td": td or "--/--",
+            "qnh": qnh or "----",
+            "cat": m.get("fltCat") or "?",
+            "remarks": p["remarks"],
         }
     except Exception as ex:
         print(f"[metar] fetch fallito: {ex}")
