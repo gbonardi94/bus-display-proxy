@@ -80,8 +80,8 @@ def fetch_atm(stop_code):
 AIS_KEY  = os.getenv('AIS_KEY', '')   # impostala come env var su Render (NON committarla)
 HOUSE_LAT = 40.9502211
 HOUSE_LON = 9.5645113
-SECTOR_MIN = 50.0     # gradi (bearing da casa)
-SECTOR_MAX = 150.0
+SECTOR_MIN = 0.0      # gradi (bearing da casa) -- TEST: 360 gradi per simulare MOBY AKI, poi tornare a 50.0
+SECTOR_MAX = 360.0     # -- TEST: poi tornare a 150.0
 MAX_NM     = 20.0     # raggio massimo in miglia nautiche
 SHIP_TTL   = 600      # scarta navi non aggiornate da 10 min
 
