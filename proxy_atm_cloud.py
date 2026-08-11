@@ -343,6 +343,41 @@ def get_planes():
 # ==========================================================================
 
 
+# ============================ METAR (Olbia) =================================
+# Ultimo METAR di LIEO (Olbia Costa Smeralda) da aviationweather.gov (NOAA,
+# gratuita, nessuna chiave), gia' campi separati cosi' l'ESP non deve fare
+# parsing di stringhe METAR grezze.
+METAR_ICAO = "LIEO"
+
+
+def get_metar():
+    try:
+        r = cf.get("https://aviationweather.gov/api/data/metar",
+                    params={"ids": METAR_ICAO, "format": "json"}, timeout=8)
+        if r.status_code != 200:
+            print(f"[metar] status {r.status_code}")
+            return None
+        data = r.json()
+        if not data:
+            return None
+        m = data[0]
+        report_time = m.get("reportTime", "")   # "2026-08-11T20:20:00.000Z"
+        hhmm = report_time[11:16].replace(":", "") if len(report_time) >= 16 else "----"
+        return {
+            "icao": m.get("icaoId", METAR_ICAO),
+            "time": f"{hhmm}z",
+            "wdir": m.get("wdir") if isinstance(m.get("wdir"), int) else 0,
+            "wspd": m.get("wspd") or 0,
+            "temp": round(m.get("temp")) if m.get("temp") is not None else 0,
+            "altim": round(m.get("altim")) if m.get("altim") is not None else 0,
+            "fltcat": m.get("fltCat") or "?",
+        }
+    except Exception as ex:
+        print(f"[metar] fetch fallito: {ex}")
+        return None
+# ==========================================================================
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         print(f"[{self.address_string()}] {fmt % args}")
@@ -378,6 +413,16 @@ class Handler(BaseHTTPRequestHandler):
         # --- Aerei (OpenSky) ---
         if parts and parts[0] == 'planes':
             body = json.dumps(get_planes()).encode()
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', len(body))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        # --- METAR (Olbia) ---
+        if parts and parts[0] == 'metar':
+            body = json.dumps(get_metar()).encode()
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
             self.send_header('Content-Length', len(body))
