@@ -1,3 +1,4 @@
 curl_cffi>=0.5.9
 pycryptodome>=3.18.0
 websocket-client>=1.6.0
+pyais>=2.5.0

@@ -10,8 +10,9 @@ Endpoint:
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from curl_cffi import requests as cf
 from urllib.parse import urlparse, parse_qs
-import os, json, time, threading, math
+import os, json, time, threading, math, base64
 import websocket  # websocket-client
+from pyais import decode as ais_decode
 
 ATM_HOME = "https://giromilano.atm.it/"
 # ATM ha dismesso il vecchio POST su /proxy.tpportal/proxy.ashx (ora risponde 403
@@ -78,10 +79,13 @@ def fetch_atm(stop_code):
 # Consuma il flusso AIS gratuito di aisstream.io via websocket, tiene in cache
 # le navi viste e le restituisce filtrate su un settore/raggio da casa.
 AIS_KEY  = os.getenv('AIS_KEY', '')   # impostala come env var su Render (NON committarla)
+# Chiave condivisa per la stazione AIS locale (RTL-SDR + AIS-catcher) che spinge
+# dati via POST /ingest (Basic Auth, password = questa chiave). NON committarla.
+INGEST_KEY = os.getenv('INGEST_KEY', '')
 HOUSE_LAT = 40.9502211
 HOUSE_LON = 9.5645113
-SECTOR_MIN = 0.0      # gradi (bearing da casa) -- TEST: 360 gradi per simulare MOBY AKI, poi tornare a 50.0
-SECTOR_MAX = 360.0     # -- TEST: poi tornare a 150.0
+SECTOR_MIN = 50.0     # gradi (bearing da casa)
+SECTOR_MAX = 150.0
 MAX_NM     = 20.0     # raggio massimo in miglia nautiche
 SHIP_TTL   = 600      # scarta navi non aggiornate da 10 min
 
@@ -191,6 +195,49 @@ def get_ships():
     for o in out:
         o.pop("_d", None)
     return out
+
+
+# Riceve i messaggi da una stazione AIS locale (RTL-SDR + AIS-catcher, opzione
+# -H in formato "AISCATCHER": {"msgs": [{"nmea": ["!AIVDM,..."]}, ...]}).
+# Decodifica ogni messaggio (posizione o dati statici/nome nave) e lo fonde
+# nella stessa cache _ships usata dal thread aisstream, cosi' get_ships() non
+# deve sapere da dove arrivano i dati.
+def ingest_ais_payload(payload):
+    count = 0
+    for m in payload.get("msgs", []):
+        lines = m.get("nmea", [])
+        if not lines:
+            continue
+        try:
+            dec = ais_decode(*[l.encode() if isinstance(l, str) else l for l in lines])
+        except Exception:
+            continue
+        mmsi = getattr(dec, "mmsi", None)
+        if mmsi is None:
+            continue
+        with _ships_lock:
+            e = _ships.setdefault(mmsi, {})
+            e["ts"] = time.time()
+            lat = getattr(dec, "lat", None)
+            lon = getattr(dec, "lon", None)
+            if lat is not None:
+                e["lat"] = lat
+            if lon is not None:
+                e["lon"] = lon
+            sog = getattr(dec, "speed", None)
+            if sog is not None:
+                e["sog"] = sog
+            cog = getattr(dec, "course", None)
+            if cog is not None:
+                e["cog"] = cog
+            name = getattr(dec, "shipname", None)
+            if name and name.strip():
+                e["name"] = name.strip()
+            dest = getattr(dec, "destination", None)
+            if dest and dest.strip():
+                e["dest"] = dest.strip()
+        count += 1
+    return count
 # ==========================================================================
 
 
@@ -255,6 +302,46 @@ class Handler(BaseHTTPRequestHandler):
                 lines.append({'line': code, 'wait': str(wait).strip()})
 
         body = json.dumps(lines).encode()
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', len(body))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        if parsed.path.strip('/') != 'ingest':
+            self.send_response(404)
+            self.end_headers()
+            return
+
+        # Basic Auth: username qualsiasi, password = INGEST_KEY.
+        auth_ok = False
+        if INGEST_KEY:
+            auth = self.headers.get('Authorization', '')
+            if auth.startswith('Basic '):
+                try:
+                    _, _, pwd = base64.b64decode(auth[6:]).decode().partition(':')
+                    auth_ok = (pwd == INGEST_KEY)
+                except Exception:
+                    auth_ok = False
+        if not auth_ok:
+            self.send_response(401)
+            self.send_header('WWW-Authenticate', 'Basic realm="ingest"')
+            self.end_headers()
+            return
+
+        length = int(self.headers.get('Content-Length', 0))
+        raw = self.rfile.read(length) if length else b''
+        try:
+            payload = json.loads(raw)
+        except Exception:
+            self.send_response(400)
+            self.end_headers()
+            return
+
+        count = ingest_ais_payload(payload)
+        body = json.dumps({"ingested": count}).encode()
         self.send_response(200)
         self.send_header('Content-Type', 'application/json')
         self.send_header('Content-Length', len(body))
