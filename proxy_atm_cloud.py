@@ -241,6 +241,108 @@ def ingest_ais_payload(payload):
 # ==========================================================================
 
 
+# ============================ AEREI (OpenSky) ==============================
+# Interroga OpenSky Network (gratuita, nessuna chiave) per gli aerei entro
+# PLANE_MAX_NM da casa e sotto PLANE_MAX_ALT_M, poi arricchisce con marche e
+# rotta (origine/destinazione IATA) via adsbdb.com. Cache in memoria per non
+# martellare adsbdb ad ogni refresh (marche = per sempre, rotte = 1 giorno).
+PLANE_MAX_NM    = 40.0     # raggio, nessun settore (360 gradi)
+PLANE_MAX_ALT_M = 3000.0   # quota massima (sotto = incluso)
+MAX_PLANES      = 3        # quanti arricchire con marche/rotta (= MAX_PAGES sull'ESP)
+PLANE_REG_CACHE = {}    # icao24 -> registration (mai scade: e' fissa per l'aereo)
+PLANE_RTE_CACHE = {}    # callsign -> (origin_iata, dest_iata, ts)
+PLANE_RTE_TTL   = 86400  # 1 giorno
+
+_pdlat = PLANE_MAX_NM / 60.0 + 0.05
+_pdlon = (PLANE_MAX_NM / 60.0) / math.cos(math.radians(HOUSE_LAT)) + 0.05
+PLANE_BBOX = (HOUSE_LAT - _pdlat, HOUSE_LAT + _pdlat, HOUSE_LON - _pdlon, HOUSE_LON + _pdlon)
+
+
+def _plane_registration(icao24):
+    if icao24 in PLANE_REG_CACHE:
+        return PLANE_REG_CACHE[icao24]
+    reg = None
+    try:
+        r = cf.get(f"https://api.adsbdb.com/v0/aircraft/{icao24}", timeout=6)
+        if r.status_code == 200:
+            reg = (r.json().get("response") or {}).get("aircraft", {}).get("registration")
+    except Exception as ex:
+        print(f"[planes] registration lookup fallita per {icao24}: {ex}")
+    PLANE_REG_CACHE[icao24] = reg
+    return reg
+
+
+def _plane_route(callsign):
+    cached = PLANE_RTE_CACHE.get(callsign)
+    if cached and (time.time() - cached[2]) < PLANE_RTE_TTL:
+        return cached[0], cached[1]
+    origin = dest = None
+    try:
+        r = cf.get(f"https://api.adsbdb.com/v0/callsign/{callsign}", timeout=6)
+        if r.status_code == 200:
+            rte = (r.json().get("response") or {}).get("flightroute")
+            if rte:
+                origin = (rte.get("origin") or {}).get("iata_code")
+                dest = (rte.get("destination") or {}).get("iata_code")
+    except Exception as ex:
+        print(f"[planes] route lookup fallita per {callsign}: {ex}")
+    PLANE_RTE_CACHE[callsign] = (origin, dest, time.time())
+    return origin, dest
+
+
+def get_planes():
+    lamin, lamax, lomin, lomax = PLANE_BBOX
+    try:
+        r = cf.get("https://opensky-network.org/api/states/all",
+                    params={"lamin": lamin, "lamax": lamax, "lomin": lomin, "lomax": lomax},
+                    timeout=10)
+        if r.status_code != 200:
+            print(f"[planes] OpenSky status {r.status_code}")
+            return []
+        states = r.json().get("states") or []
+    except Exception as ex:
+        print(f"[planes] OpenSky fetch fallito: {ex}")
+        return []
+
+    cands = []
+    for s in states:
+        callsign = (s[1] or "").strip()
+        lon, lat, baro_alt, on_ground = s[5], s[6], s[7], s[8]
+        velocity, track, vrate = s[9], s[10], s[11]
+        if not callsign or on_ground or lat is None or lon is None or baro_alt is None:
+            continue
+        if baro_alt > PLANE_MAX_ALT_M:
+            continue
+        d = _haversine_nm(HOUSE_LAT, HOUSE_LON, lat, lon)
+        if d > PLANE_MAX_NM:
+            continue
+        cands.append({
+            "icao24": s[0], "callsign": callsign, "alt_m": baro_alt,
+            "speed_kt": (velocity or 0.0) * 1.94384,
+            "track": track or 0.0, "vrate_fpm": (vrate or 0.0) * 196.850,
+            "dist": d,
+        })
+    cands.sort(key=lambda x: x["dist"])
+    cands = cands[:MAX_PLANES]
+
+    out = []
+    for c in cands:
+        reg = _plane_registration(c["icao24"])
+        origin, dest = _plane_route(c["callsign"])
+        out.append({
+            "callsign": c["callsign"],
+            "reg": reg or "",
+            "origin": origin or "",
+            "dest": dest or "",
+            "alt_ft": round(c["alt_m"] * 3.28084),
+            "speed_kt": round(c["speed_kt"]),
+            "vrate_fpm": round(c["vrate_fpm"]),
+            "dist": round(c["dist"], 1),
+        })
+    return out
+# ==========================================================================
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         print(f"[{self.address_string()}] {fmt % args}")
@@ -266,6 +368,16 @@ class Handler(BaseHTTPRequestHandler):
         # --- Navi (AIS) ---
         if parts and parts[0] == 'ships':
             body = json.dumps(get_ships()).encode()
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', len(body))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        # --- Aerei (OpenSky) ---
+        if parts and parts[0] == 'planes':
+            body = json.dumps(get_planes()).encode()
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
             self.send_header('Content-Length', len(body))
