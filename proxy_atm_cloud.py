@@ -92,6 +92,7 @@ BBOX = [[HOUSE_LAT - _dlat, HOUSE_LON - 0.05], [HOUSE_LAT + _dlat, HOUSE_LON + _
 
 _ships = {}                    # mmsi -> {name, sog, cog, dest, lat, lon, ts}
 _ships_lock = threading.Lock()
+_ais_connected = False         # true mentre il websocket aisstream e' su
 
 
 def _haversine_nm(lat1, lon1, lat2, lon2):
@@ -120,11 +121,13 @@ def _ais_thread():
         "BoundingBoxes": [[[BBOX[0][0], BBOX[0][1]], [BBOX[1][0], BBOX[1][1]]]],
         "FilterMessageTypes": ["PositionReport", "ShipStaticData"],
     }
+    global _ais_connected
     while True:
         try:
             ws = websocket.create_connection("wss://stream.aisstream.io/v0/stream", timeout=30)
             ws.send(json.dumps(sub))
             print(f"AIS: connesso, bbox={BBOX}")
+            _ais_connected = True
             while True:
                 msg = json.loads(ws.recv())
                 mt = msg.get("MessageType")
@@ -150,6 +153,7 @@ def _ais_thread():
                             e["name"] = nm
                         e["dest"] = (sd.get("Destination") or "").strip()
         except Exception as ex:
+            _ais_connected = False
             print(f"AIS ws error: {ex}; riconnetto tra 5s")
             time.sleep(5)
 
@@ -197,6 +201,20 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse(self.path)
         parts = parsed.path.strip('/').split('/')
+
+        # --- Navi (AIS): stato diagnostico (chiave impostata? websocket connesso?) ---
+        if parts[:2] == ['ships', 'status']:
+            body = json.dumps({
+                "ais_key_set": bool(AIS_KEY),
+                "connected": _ais_connected,
+                "ships_cached": len(_ships),
+            }).encode()
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', len(body))
+            self.end_headers()
+            self.wfile.write(body)
+            return
 
         # --- Navi (AIS) ---
         if parts and parts[0] == 'ships':
