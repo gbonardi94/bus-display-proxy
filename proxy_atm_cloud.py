@@ -252,6 +252,12 @@ MAX_PLANES      = 3        # quanti arricchire con marche/rotta (= MAX_PAGES sul
 PLANE_REG_CACHE = {}    # icao24 -> registration (mai scade: e' fissa per l'aereo)
 PLANE_RTE_CACHE = {}    # callsign -> (origin_iata, dest_iata, ts)
 PLANE_RTE_TTL   = 86400  # 1 giorno
+PLANE_REFRESH   = 20     # secondi tra un aggiornamento e l'altro (OpenSky rate-limit ~10s)
+
+# Cache servita all'ESP: OpenSky+adsbdb sono lenti (10-20s), l'ESP ha timeout
+# 10s -> un thread aggiorna in background e l'endpoint /planes ritorna subito.
+_planes_cache = []
+_planes_lock = threading.Lock()
 
 _pdlat = PLANE_MAX_NM / 60.0 + 0.05
 _pdlon = (PLANE_MAX_NM / 60.0) / math.cos(math.radians(HOUSE_LAT)) + 0.05
@@ -290,7 +296,7 @@ def _plane_route(callsign):
     return origin, dest
 
 
-def get_planes():
+def _compute_planes():
     lamin, lamax, lomin, lomax = PLANE_BBOX
     try:
         r = cf.get("https://opensky-network.org/api/states/all",
@@ -340,17 +346,39 @@ def get_planes():
             "dist": round(c["dist"], 1),
         })
     return out
+
+
+def _planes_thread():
+    global _planes_cache
+    while True:
+        try:
+            result = _compute_planes()
+            with _planes_lock:
+                _planes_cache = result
+        except Exception as ex:
+            print(f"[planes] refresh fallito: {ex}")
+        time.sleep(PLANE_REFRESH)
+
+
+def get_planes():
+    with _planes_lock:
+        return list(_planes_cache)
 # ==========================================================================
 
 
 # ============================ METAR (Olbia) =================================
 # Ultimo METAR di LIEO (Olbia Costa Smeralda) da aviationweather.gov (NOAA,
 # gratuita, nessuna chiave), gia' campi separati cosi' l'ESP non deve fare
-# parsing di stringhe METAR grezze.
-METAR_ICAO = "LIEO"
+# parsing di stringhe METAR grezze. Come per gli aerei, un thread aggiorna in
+# background e l'endpoint ritorna subito la cache (l'upstream e' lento e il
+# METAR cambia ~ogni 30 min).
+METAR_ICAO    = "LIEO"
+METAR_REFRESH = 300      # secondi (5 min)
+_metar_cache = None
+_metar_lock = threading.Lock()
 
 
-def get_metar():
+def _compute_metar():
     try:
         r = cf.get("https://aviationweather.gov/api/data/metar",
                     params={"ids": METAR_ICAO, "format": "json"}, timeout=8)
@@ -375,6 +403,21 @@ def get_metar():
     except Exception as ex:
         print(f"[metar] fetch fallito: {ex}")
         return None
+
+
+def _metar_thread():
+    global _metar_cache
+    while True:
+        result = _compute_metar()
+        if result is not None:      # in caso di errore transitorio tieni l'ultimo buono
+            with _metar_lock:
+                _metar_cache = result
+        time.sleep(METAR_REFRESH)
+
+
+def get_metar():
+    with _metar_lock:
+        return _metar_cache
 # ==========================================================================
 
 
@@ -514,7 +557,10 @@ if __name__ == '__main__':
         print("Sessione pre-scaldata: cookie ATM pronto")
     except Exception as e:
         print(f"Pre-warm fallito (riprovera' alla prima richiesta): {e}")
-    # Avvia il consumatore AIS in background (navi).
+    # Avvia i worker in background: navi (AIS), aerei (OpenSky), METAR (Olbia).
+    # Aerei e METAR aggiornano una cache cosi' l'ESP (timeout 10s) riceve subito.
     threading.Thread(target=_ais_thread, daemon=True).start()
-    print(f"Proxy avviato su http://0.0.0.0:{PORT}  (/atm/12806  |  /ships)")
+    threading.Thread(target=_planes_thread, daemon=True).start()
+    threading.Thread(target=_metar_thread, daemon=True).start()
+    print(f"Proxy avviato su http://0.0.0.0:{PORT}  (/atm/12806 | /ships | /planes | /metar)")
     HTTPServer(('0.0.0.0', PORT), Handler).serve_forever()
