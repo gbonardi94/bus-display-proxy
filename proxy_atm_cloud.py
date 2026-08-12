@@ -246,7 +246,7 @@ def ingest_ais_payload(payload):
 # PLANE_MAX_NM da casa e sotto PLANE_MAX_ALT_M, poi arricchisce con marche e
 # rotta (origine/destinazione IATA) via adsbdb.com. Cache in memoria per non
 # martellare adsbdb ad ogni refresh (marche = per sempre, rotte = 1 giorno).
-PLANE_MAX_NM    = 40.0     # raggio, nessun settore (360 gradi)
+PLANE_MAX_NM    = 10.0     # raggio, nessun settore (360 gradi)
 PLANE_MAX_ALT_M = 3000.0   # quota massima (sotto = incluso)
 MAX_PLANES      = 3        # quanti arricchire con marche/rotta (= MAX_PAGES sull'ESP)
 PLANE_REG_CACHE = {}    # icao24 -> registration (mai scade: e' fissa per l'aereo)
