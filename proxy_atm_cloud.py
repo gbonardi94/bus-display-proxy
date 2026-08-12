@@ -616,9 +616,10 @@ def _parse_ferry_tables(html, harbor):
             if len(cells) < 3 or not re.match(r'^\d{1,2}:\d{2}$', cells[2]):
                 continue
             status = " ".join(cells[3:]).lower()
+            molo = cells[-1] if len(cells) >= 4 else ""      # il molo e' l'ultima colonna
             out.append({
                 "ship": cells[0], "port": cells[1], "time": cells[2],
-                "dir": direction, "harbor": harbor, "status": status,
+                "dir": direction, "harbor": harbor, "status": status, "molo": molo,
             })
     return out
 
@@ -660,7 +661,7 @@ def _compute_ferries():
             continue
         if now_min - tm > 120:            # oltre 2h nel passato: scarta comunque
             continue
-        shown.append({k: f[k] for k in ("ship", "port", "time", "dir", "harbor")})
+        shown.append({k: f[k] for k in ("ship", "port", "time", "dir", "harbor", "molo")})
     shown.sort(key=tmin)
     return shown
 
