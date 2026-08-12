@@ -355,6 +355,7 @@ def _planes_thread():
             result = _compute_planes()
             with _planes_lock:
                 _planes_cache = result
+            _update_planes_log(result)
         except Exception as ex:
             print(f"[planes] refresh fallito: {ex}")
         time.sleep(PLANE_REFRESH)
@@ -363,6 +364,79 @@ def _planes_thread():
 def get_planes():
     with _planes_lock:
         return list(_planes_cache)
+
+
+# --- Log dei voli passati (in memoria; sopravvive finche' il processo e' vivo,
+# cioe' tenuto sveglio dal cron keep-warm; si azzera a un redeploy). Un record
+# per volo (callsign), con orari e valori salienti. Interrogabile su
+# GET /planes/log (JSON) o /planes/log?html=1 (tabella leggibile). -----------
+PLANE_LOG_MAX = 800
+_planes_log = {}                 # callsign -> record
+_planes_log_lock = threading.Lock()
+
+
+def _update_planes_log(planes):
+    now = time.time()
+    with _planes_log_lock:
+        for p in planes:
+            cs = p["callsign"]
+            direction = "DEP" if p["origin"] == "OLB" else ("ARR" if p["dest"] == "OLB" else "OVF")
+            r = _planes_log.get(cs)
+            if r is None:
+                _planes_log[cs] = {
+                    "callsign": cs, "reg": p["reg"], "origin": p["origin"], "dest": p["dest"],
+                    "dir": direction, "first_seen": now, "last_seen": now, "sightings": 1,
+                    "min_alt_ft": p["alt_ft"], "max_speed_kt": p["speed_kt"], "closest_nm": p["dist"],
+                }
+            else:
+                r["last_seen"] = now
+                r["sightings"] += 1
+                if p["reg"] and not r["reg"]:       r["reg"] = p["reg"]
+                if p["origin"] and not r["origin"]: r["origin"] = p["origin"]
+                if p["dest"] and not r["dest"]:     r["dest"] = p["dest"]
+                r["dir"] = direction
+                r["min_alt_ft"] = min(r["min_alt_ft"], p["alt_ft"])
+                r["max_speed_kt"] = max(r["max_speed_kt"], p["speed_kt"])
+                r["closest_nm"] = min(r["closest_nm"], p["dist"])
+        if len(_planes_log) > PLANE_LOG_MAX:
+            excess = len(_planes_log) - PLANE_LOG_MAX
+            for o in sorted(_planes_log.values(), key=lambda x: x["last_seen"])[:excess]:
+                _planes_log.pop(o["callsign"], None)
+
+
+def get_planes_log():
+    with _planes_log_lock:
+        return sorted(_planes_log.values(), key=lambda x: x["last_seen"], reverse=True)
+
+
+def _hhmm(epoch):
+    t = time.gmtime(epoch)
+    return f"{t.tm_hour:02d}:{t.tm_min:02d}z"
+
+
+def _planes_log_html():
+    rows = get_planes_log()
+    label = {"DEP": "parte OLB", "ARR": "arriva OLB", "OVF": "sorvolo"}
+    trs = []
+    for r in rows:
+        route = f'{r["origin"] or "?"}-{r["dest"] or "?"}'
+        trs.append(
+            f'<tr><td>{_hhmm(r["first_seen"])}</td><td>{_hhmm(r["last_seen"])}</td>'
+            f'<td>{r["callsign"]}</td><td>{r["reg"] or ""}</td><td>{route}</td>'
+            f'<td>{label.get(r["dir"], r["dir"])}</td><td>{r["min_alt_ft"]}ft</td>'
+            f'<td>{r["max_speed_kt"]}kn</td><td>{r["closest_nm"]}nm</td></tr>'
+        )
+    return (
+        "<!doctype html><meta charset=utf-8><title>Log voli</title>"
+        "<style>body{font-family:system-ui,sans-serif;margin:1.5rem;background:#111;color:#eee}"
+        "table{border-collapse:collapse;width:100%;font-size:14px}"
+        "th,td{border:1px solid #333;padding:5px 9px;text-align:left}"
+        "th{background:#1d1d1d}tr:nth-child(even){background:#181818}h1{font-size:18px}</style>"
+        f"<h1>Voli passati ({len(rows)}) &mdash; orari UTC</h1>"
+        "<table><tr><th>primo</th><th>ultimo</th><th>callsign</th><th>marche</th>"
+        "<th>rotta</th><th>tipo</th><th>quota min</th><th>vel max</th><th>dist min</th></tr>"
+        + "".join(trs) + "</table>"
+    )
 # ==========================================================================
 
 
@@ -515,6 +589,22 @@ class Handler(BaseHTTPRequestHandler):
             body = json.dumps(get_ships()).encode()
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', len(body))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        # --- Log dei voli passati (JSON, o ?html=1 per tabella leggibile) ---
+        if parts[:2] == ['planes', 'log']:
+            qs = parse_qs(parsed.query)
+            if qs.get('html'):
+                body = _planes_log_html().encode()
+                ctype = 'text/html; charset=utf-8'
+            else:
+                body = json.dumps(get_planes_log()).encode()
+                ctype = 'application/json'
+            self.send_response(200)
+            self.send_header('Content-Type', ctype)
             self.send_header('Content-Length', len(body))
             self.end_headers()
             self.wfile.write(body)
