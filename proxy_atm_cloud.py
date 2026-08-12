@@ -11,8 +11,14 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from curl_cffi import requests as cf
 from urllib.parse import urlparse, parse_qs
 import os, json, time, threading, math, base64, re
+from datetime import datetime
 import websocket  # websocket-client
 from pyais import decode as ais_decode
+try:
+    from zoneinfo import ZoneInfo
+    _ROME = ZoneInfo("Europe/Rome")
+except Exception:
+    _ROME = None
 
 ATM_HOME = "https://giromilano.atm.it/"
 # ATM ha dismesso il vecchio POST su /proxy.tpportal/proxy.ashx (ora risponde 403
@@ -580,6 +586,103 @@ def get_metar():
 # ==========================================================================
 
 
+# ============================ TRAGHETTI (Olbia + Golfo Aranci) =============
+# Scraping degli orari transiti (schedulati, non AIS): Olbia e Golfo Aranci
+# arrivano dallo stesso backend portodiolbia.it, tabelle HTML server-rendered.
+# Regole di rimozione: "Sbarco terminato" (arrivo) -> via subito; "Partito"
+# (partenza) -> via 1 ora dopo l'orario. Un thread aggiorna in background.
+FERRY_SOURCES = [
+    ("OLB", "https://www.portodiolbia.it/it/porto/orario-transiti"),
+    ("GA",  "https://www.portodiolbia.it/home/golfo_aranci"),
+]
+FERRY_REFRESH = 180      # secondi (3 min)
+_ferries_cache = []
+_ferries_lock = threading.Lock()
+
+
+def _parse_ferry_tables(html, harbor):
+    out = []
+    for t in re.findall(r'<table.*?</table>', html, re.S):
+        heads = " ".join(re.sub(r'<[^>]+>', ' ', h) for h in re.findall(r'<th[^>]*>(.*?)</th>', t, re.S)).upper()
+        if 'PARTENZA' in heads:
+            direction = 'DEP'
+        elif 'ARRIVO' in heads:
+            direction = 'ARR'
+        else:
+            continue   # es. tabella autobus di Golfo Aranci
+        for row in re.findall(r'<tr[^>]*>(.*?)</tr>', row_wrap(t), re.S):
+            cells = [re.sub(r'\s+', ' ', re.sub(r'<[^>]+>', ' ', c)).strip()
+                     for c in re.findall(r'<td[^>]*>(.*?)</td>', row, re.S)]
+            if len(cells) < 3 or not re.match(r'^\d{1,2}:\d{2}$', cells[2]):
+                continue
+            status = " ".join(cells[3:]).lower()
+            out.append({
+                "ship": cells[0], "port": cells[1], "time": cells[2],
+                "dir": direction, "harbor": harbor, "status": status,
+            })
+    return out
+
+
+def row_wrap(t):
+    # estrae solo il corpo (tbody) se presente, per non prendere l'header <tr>
+    m = re.search(r'<tbody.*?</tbody>', t, re.S)
+    return m.group(0) if m else t
+
+
+def _compute_ferries():
+    allf = []
+    for harbor, url in FERRY_SOURCES:
+        try:
+            r = cf.get(url, timeout=12)
+            if r.status_code == 200:
+                allf += _parse_ferry_tables(r.text, harbor)
+            else:
+                print(f"[ferries] {harbor} HTTP {r.status_code}")
+        except Exception as ex:
+            print(f"[ferries] {harbor} fallito: {ex}")
+
+    now = datetime.now(_ROME) if _ROME else datetime.utcnow()
+    now_min = now.hour * 60 + now.minute
+
+    def tmin(f):
+        h, m = f["time"].split(":")
+        return int(h) * 60 + int(m)
+
+    shown = []
+    for f in allf:
+        tm = tmin(f)
+        st = f["status"]
+        disembarked = 'sbarco' in st and ('terminat' in st or 'complet' in st)
+        departed = 'partito' in st
+        if f["dir"] == 'ARR' and disembarked:
+            continue
+        if f["dir"] == 'DEP' and departed and now_min > tm + 60:
+            continue
+        if now_min - tm > 120:            # oltre 2h nel passato: scarta comunque
+            continue
+        shown.append({k: f[k] for k in ("ship", "port", "time", "dir", "harbor")})
+    shown.sort(key=tmin)
+    return shown
+
+
+def _ferries_thread():
+    global _ferries_cache
+    while True:
+        try:
+            result = _compute_ferries()
+            with _ferries_lock:
+                _ferries_cache = result
+        except Exception as ex:
+            print(f"[ferries] refresh fallito: {ex}")
+        time.sleep(FERRY_REFRESH)
+
+
+def get_ferries():
+    with _ferries_lock:
+        return list(_ferries_cache)
+# ==========================================================================
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         print(f"[{self.address_string()}] {fmt % args}")
@@ -659,6 +762,16 @@ class Handler(BaseHTTPRequestHandler):
         # --- METAR (Olbia) ---
         if parts and parts[0] == 'metar':
             body = json.dumps(get_metar()).encode()
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', len(body))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        # --- Traghetti (Olbia + Golfo Aranci) ---
+        if parts and parts[0] == 'ferries':
+            body = json.dumps(get_ferries()).encode()
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
             self.send_header('Content-Length', len(body))
@@ -755,5 +868,6 @@ if __name__ == '__main__':
     threading.Thread(target=_ais_thread, daemon=True).start()
     threading.Thread(target=_planes_thread, daemon=True).start()
     threading.Thread(target=_metar_thread, daemon=True).start()
-    print(f"Proxy avviato su http://0.0.0.0:{PORT}  (/atm/12806 | /ships | /planes | /metar)")
+    threading.Thread(target=_ferries_thread, daemon=True).start()
+    print(f"Proxy avviato su http://0.0.0.0:{PORT}  (/atm | /ships | /planes | /metar | /ferries)")
     HTTPServer(('0.0.0.0', PORT), Handler).serve_forever()
