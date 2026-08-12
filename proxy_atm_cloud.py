@@ -599,6 +599,22 @@ FERRY_REFRESH = 180      # secondi (3 min)
 _ferries_cache = []
 _ferries_lock = threading.Lock()
 
+# LOCODE UN/LOCODE (3 char finali, senza il paese) dei porti collegati.
+LOCODE = {
+    "civitavecchia": "CVV", "livorno": "LIV", "genova": "GOA", "napoli": "NAP",
+    "piombino": "PIO", "bonifacio": "BON", "porto torres": "PTO", "cagliari": "CAG",
+    "barcellona": "BCN", "barcelona": "BCN", "tolone": "TLN", "marsiglia": "MRS",
+    "nizza": "NCE", "arbatax": "ATX",
+}
+
+
+def _locode(port):
+    p = (port or "").strip().lower()
+    if p in LOCODE:
+        return LOCODE[p]
+    letters = re.sub(r'[^a-z]', '', p)
+    return letters[:3].upper() if letters else "?"
+
 
 def _parse_ferry_tables(html, harbor):
     out = []
@@ -615,11 +631,12 @@ def _parse_ferry_tables(html, harbor):
                      for c in re.findall(r'<td[^>]*>(.*?)</td>', row, re.S)]
             if len(cells) < 3 or not re.match(r'^\d{1,2}:\d{2}$', cells[2]):
                 continue
-            status = " ".join(cells[3:]).lower()
-            molo = cells[-1] if len(cells) >= 4 else ""      # il molo e' l'ultima colonna
+            # Colonne: ...ORA [ORA EFF] STATUS MOLO -> molo = ultima, stato = penultima
+            molo = cells[-1] if len(cells) >= 4 else ""
+            status = cells[-2] if len(cells) >= 4 else ""
             out.append({
-                "ship": cells[0], "port": cells[1], "time": cells[2],
-                "dir": direction, "harbor": harbor, "status": status, "molo": molo,
+                "ship": cells[0], "port": cells[1], "time": cells[2], "dir": direction,
+                "harbor": harbor, "status": status, "molo": molo, "locode": _locode(cells[1]),
             })
     return out
 
@@ -652,7 +669,7 @@ def _compute_ferries():
     shown = []
     for f in allf:
         tm = tmin(f)
-        st = f["status"]
+        st = f["status"].lower()
         disembarked = 'sbarco' in st and ('terminat' in st or 'complet' in st)
         departed = 'partito' in st
         if f["dir"] == 'ARR' and disembarked:
@@ -661,7 +678,7 @@ def _compute_ferries():
             continue
         if now_min - tm > 120:            # oltre 2h nel passato: scarta comunque
             continue
-        shown.append({k: f[k] for k in ("ship", "port", "time", "dir", "harbor", "molo")})
+        shown.append({k: f[k] for k in ("ship", "port", "time", "dir", "harbor", "molo", "status", "locode")})
     shown.sort(key=tmin)
     return shown
 
