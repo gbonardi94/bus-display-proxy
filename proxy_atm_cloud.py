@@ -296,58 +296,73 @@ def _plane_route(callsign):
     return origin, dest
 
 
-_planes_diag = {"status": None, "raw": None, "err": None, "ts": 0}
+PLANE_MAX_ALT_FT = round(PLANE_MAX_ALT_M * 3.28084)   # 3000 m -> ~9843 ft
+_planes_diag = {"status": None, "raw": None, "err": None, "ts": 0, "src": None}
+
+
+def _fetch_adsb():
+    """Prova adsb.lol e poi airplanes.live (stesso formato tar1090): entrambe
+    gratuite, prendono direttamente punto+raggio e non bloccano gli IP cloud
+    come fa OpenSky. Ritorna (lista_ac, sorgente) o ([], None) su errore."""
+    n = int(round(PLANE_MAX_NM))
+    sources = [
+        ("adsb.lol", f"https://api.adsb.lol/v2/lat/{HOUSE_LAT}/lon/{HOUSE_LON}/dist/{n}"),
+        ("airplanes.live", f"https://api.airplanes.live/v2/point/{HOUSE_LAT}/{HOUSE_LON}/{n}"),
+    ]
+    last_err = None
+    for name, url in sources:
+        try:
+            r = cf.get(url, timeout=10)
+            if r.status_code == 200:
+                ac = r.json().get("ac") or []
+                _planes_diag.update(status=r.status_code, raw=len(ac), err=None,
+                                    ts=time.time(), src=name)
+                return ac, name
+            last_err = f"{name} HTTP {r.status_code}"
+        except Exception as ex:
+            last_err = f"{name}: {ex}"
+    _planes_diag.update(status=None, raw=None, err=last_err, ts=time.time(), src=None)
+    print(f"[planes] tutte le sorgenti ADS-B fallite: {last_err}")
+    return [], None
 
 
 def _compute_planes():
-    lamin, lamax, lomin, lomax = PLANE_BBOX
-    try:
-        r = cf.get("https://opensky-network.org/api/states/all",
-                    params={"lamin": lamin, "lamax": lamax, "lomin": lomin, "lomax": lomax},
-                    timeout=10)
-        _planes_diag.update(status=r.status_code, err=None, ts=time.time())
-        if r.status_code != 200:
-            _planes_diag["raw"] = None
-            print(f"[planes] OpenSky status {r.status_code}")
-            return []
-        states = r.json().get("states") or []
-        _planes_diag["raw"] = len(states)
-    except Exception as ex:
-        _planes_diag.update(status=None, raw=None, err=str(ex), ts=time.time())
-        print(f"[planes] OpenSky fetch fallito: {ex}")
-        return []
+    ac, _src = _fetch_adsb()
 
     cands = []
-    for s in states:
-        callsign = (s[1] or "").strip()
-        lon, lat, baro_alt, on_ground = s[5], s[6], s[7], s[8]
-        velocity, track, vrate = s[9], s[10], s[11]
-        if not callsign or on_ground or lat is None or lon is None or baro_alt is None:
+    for a in ac:
+        callsign = (a.get("flight") or "").strip()
+        alt = a.get("alt_baro")
+        if not callsign or not isinstance(alt, (int, float)):   # "ground" o mancante -> salta
             continue
-        if baro_alt > PLANE_MAX_ALT_M:
+        if alt > PLANE_MAX_ALT_FT:
             continue
-        d = _haversine_nm(HOUSE_LAT, HOUSE_LON, lat, lon)
-        if d > PLANE_MAX_NM:
+        dist = a.get("dst")
+        if dist is None:
+            lat, lon = a.get("lat"), a.get("lon")
+            if lat is None or lon is None:
+                continue
+            dist = _haversine_nm(HOUSE_LAT, HOUSE_LON, lat, lon)
+        if dist > PLANE_MAX_NM:
             continue
         cands.append({
-            "icao24": s[0], "callsign": callsign, "alt_m": baro_alt,
-            "speed_kt": (velocity or 0.0) * 1.94384,
-            "track": track or 0.0, "vrate_fpm": (vrate or 0.0) * 196.850,
-            "dist": d,
+            "icao24": a.get("hex", ""), "callsign": callsign, "reg": (a.get("r") or "").strip(),
+            "alt_ft": int(alt), "speed_kt": a.get("gs") or 0,
+            "vrate_fpm": a.get("baro_rate") or 0, "dist": dist,
         })
     cands.sort(key=lambda x: x["dist"])
     cands = cands[:MAX_PLANES]
 
     out = []
     for c in cands:
-        reg = _plane_registration(c["icao24"])
+        reg = c["reg"] or (_plane_registration(c["icao24"]) or "")
         origin, dest = _plane_route(c["callsign"])
         out.append({
             "callsign": c["callsign"],
-            "reg": reg or "",
+            "reg": reg,
             "origin": origin or "",
             "dest": dest or "",
-            "alt_ft": round(c["alt_m"] * 3.28084),
+            "alt_ft": round(c["alt_ft"]),
             "speed_kt": round(c["speed_kt"]),
             "vrate_fpm": round(c["vrate_fpm"]),
             "dist": round(c["dist"], 1),
@@ -604,8 +619,9 @@ class Handler(BaseHTTPRequestHandler):
         # --- Diagnostica OpenSky (ultimo status HTTP e n. aerei grezzi) ---
         if parts[:2] == ['planes', 'status']:
             body = json.dumps({
+                "source": _planes_diag["src"],
                 "last_http_status": _planes_diag["status"],
-                "raw_states": _planes_diag["raw"],
+                "raw_aircraft": _planes_diag["raw"],
                 "last_error": _planes_diag["err"],
                 "age_sec": round(time.time() - _planes_diag["ts"], 1) if _planes_diag["ts"] else None,
                 "in_range_now": len(get_planes()),
