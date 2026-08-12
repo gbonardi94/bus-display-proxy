@@ -616,6 +616,18 @@ def _locode(port):
     return letters[:3].upper() if letters else "?"
 
 
+def _status_display(s):
+    # Normalizza alcuni stati per il display: imbarco in corso -> Imbarco,
+    # imbarco terminato/chiuso -> Pronta. Gli altri passano invariati.
+    sl = s.lower()
+    if 'imbarco' in sl:
+        if 'corso' in sl:
+            return "Imbarco"
+        if 'terminat' in sl or 'chius' in sl:
+            return "Pronta"
+    return s
+
+
 def _parse_ferry_tables(html, harbor):
     # Le colonne differiscono (arrivi Olbia ha ORA EFFETTIVA e MOTIVO RITARDO):
     # si mappano per NOME di intestazione, non per posizione.
@@ -718,18 +730,17 @@ def _compute_ferries():
         if now_min - tm > 120:            # oltre 2h nel passato: scarta comunque
             continue
 
-        # Testo di fallback quando lo STATUS e' vuoto.
-        if f["dir"] == 'ARR':
-            fallback = "IN ARRIVO"
-        else:
+        # Partenza di una nave che non e' ancora arrivata: non la mostriamo.
+        if f["dir"] == 'DEP':
             key = (f["harbor"], f["ship"])
             if key in arrival_arrived and not arrival_arrived[key]:
-                fallback = "NON ARRIVATA"     # deve ancora arrivare per poter ripartire
-            else:
-                fallback = "FERMA"
+                continue
+
+        fallback = "IN ARRIVO" if f["dir"] == 'ARR' else "FERMA"
 
         rec = {k: f[k] for k in ("ship", "port", "time", "dir", "harbor", "molo",
                                  "status", "motivo", "eff", "locode")}
+        rec["status"] = _status_display(f["status"])
         rec["fallback"] = fallback
         shown.append(rec)
     shown.sort(key=tmin)
