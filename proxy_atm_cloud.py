@@ -296,17 +296,24 @@ def _plane_route(callsign):
     return origin, dest
 
 
+_planes_diag = {"status": None, "raw": None, "err": None, "ts": 0}
+
+
 def _compute_planes():
     lamin, lamax, lomin, lomax = PLANE_BBOX
     try:
         r = cf.get("https://opensky-network.org/api/states/all",
                     params={"lamin": lamin, "lamax": lamax, "lomin": lomin, "lomax": lomax},
                     timeout=10)
+        _planes_diag.update(status=r.status_code, err=None, ts=time.time())
         if r.status_code != 200:
+            _planes_diag["raw"] = None
             print(f"[planes] OpenSky status {r.status_code}")
             return []
         states = r.json().get("states") or []
+        _planes_diag["raw"] = len(states)
     except Exception as ex:
+        _planes_diag.update(status=None, raw=None, err=str(ex), ts=time.time())
         print(f"[planes] OpenSky fetch fallito: {ex}")
         return []
 
@@ -587,6 +594,23 @@ class Handler(BaseHTTPRequestHandler):
         # --- Navi (AIS) ---
         if parts and parts[0] == 'ships':
             body = json.dumps(get_ships()).encode()
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', len(body))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        # --- Diagnostica OpenSky (ultimo status HTTP e n. aerei grezzi) ---
+        if parts[:2] == ['planes', 'status']:
+            body = json.dumps({
+                "last_http_status": _planes_diag["status"],
+                "raw_states": _planes_diag["raw"],
+                "last_error": _planes_diag["err"],
+                "age_sec": round(time.time() - _planes_diag["ts"], 1) if _planes_diag["ts"] else None,
+                "in_range_now": len(get_planes()),
+                "radius_nm": PLANE_MAX_NM,
+            }).encode()
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
             self.send_header('Content-Length', len(body))
