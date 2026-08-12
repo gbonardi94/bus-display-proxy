@@ -329,13 +329,13 @@ def _fetch_adsb():
 def _compute_planes():
     ac, _src = _fetch_adsb()
 
-    cands = []
+    # Arricchisce TUTTI gli aerei in raggio (qualsiasi quota) con marche e rotta:
+    # servono al log completo. Il display filtra poi per quota.
+    inrange = []
     for a in ac:
         callsign = (a.get("flight") or "").strip()
         alt = a.get("alt_baro")
         if not callsign or not isinstance(alt, (int, float)):   # "ground" o mancante -> salta
-            continue
-        if alt > PLANE_MAX_ALT_FT:
             continue
         dist = a.get("dst")
         if dist is None:
@@ -345,39 +345,35 @@ def _compute_planes():
             dist = _haversine_nm(HOUSE_LAT, HOUSE_LON, lat, lon)
         if dist > PLANE_MAX_NM:
             continue
-        cands.append({
-            "icao24": a.get("hex", ""), "callsign": callsign, "reg": (a.get("r") or "").strip(),
-            "alt_ft": int(alt), "speed_kt": a.get("gs") or 0,
-            "vrate_fpm": a.get("baro_rate") or 0, "dist": dist,
-        })
-    cands.sort(key=lambda x: x["dist"])
-    cands = cands[:MAX_PLANES]
-
-    out = []
-    for c in cands:
-        reg = c["reg"] or (_plane_registration(c["icao24"]) or "")
-        origin, dest = _plane_route(c["callsign"])
-        out.append({
-            "callsign": c["callsign"],
-            "reg": reg,
+        origin, dest = _plane_route(callsign)
+        inrange.append({
+            "callsign": callsign,
+            "reg": (a.get("r") or "").strip(),
             "origin": origin or "",
             "dest": dest or "",
-            "alt_ft": round(c["alt_ft"]),
-            "speed_kt": round(c["speed_kt"]),
-            "vrate_fpm": round(c["vrate_fpm"]),
-            "dist": round(c["dist"], 1),
+            "alt_ft": int(alt),
+            "speed_kt": round(a.get("gs") or 0),
+            "vrate_fpm": round(a.get("baro_rate") or 0),
+            "dist": round(dist, 1),
         })
-    return out
+
+    # Log: ogni aereo entro il raggio, a QUALSIASI quota (cosi' si sa cosa e'
+    # passato anche se troppo alto per il display).
+    _update_planes_log(inrange)
+
+    # Display: solo sotto la quota massima, i piu' vicini per primi.
+    disp = sorted((r for r in inrange if r["alt_ft"] <= PLANE_MAX_ALT_FT),
+                  key=lambda x: x["dist"])
+    return disp[:MAX_PLANES]
 
 
 def _planes_thread():
     global _planes_cache
     while True:
         try:
-            result = _compute_planes()
+            result = _compute_planes()   # aggiorna internamente anche il log
             with _planes_lock:
                 _planes_cache = result
-            _update_planes_log(result)
         except Exception as ex:
             print(f"[planes] refresh fallito: {ex}")
         time.sleep(PLANE_REFRESH)
