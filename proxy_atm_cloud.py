@@ -617,26 +617,54 @@ def _locode(port):
 
 
 def _parse_ferry_tables(html, harbor):
+    # Le colonne differiscono (arrivi Olbia ha ORA EFFETTIVA e MOTIVO RITARDO):
+    # si mappano per NOME di intestazione, non per posizione.
     out = []
     for t in re.findall(r'<table.*?</table>', html, re.S):
-        heads = " ".join(re.sub(r'<[^>]+>', ' ', h) for h in re.findall(r'<th[^>]*>(.*?)</th>', t, re.S)).upper()
-        if 'PARTENZA' in heads:
+        heads = [re.sub(r'\s+', ' ', re.sub(r'<[^>]+>', ' ', h)).strip().upper()
+                 for h in re.findall(r'<th[^>]*>(.*?)</th>', t, re.S)]
+        blob = " ".join(heads)
+        if 'PARTENZA' in blob:
             direction = 'DEP'
-        elif 'ARRIVO' in heads:
+        elif 'ARRIVO' in blob:
             direction = 'ARR'
         else:
             continue   # es. tabella autobus di Golfo Aranci
+
+        def col_exact(name):
+            for i, h in enumerate(heads):
+                if h == name:
+                    return i
+            return -1
+
+        def col_has(sub):
+            for i, h in enumerate(heads):
+                if sub in h:
+                    return i
+            return -1
+
+        i_ship = 0
+        i_port = 1
+        i_ora = col_exact('ORA')
+        i_eff = col_has('EFFETTIVA')
+        i_status = col_exact('STATUS')
+        i_motivo = col_has('MOTIVO')
+        i_molo = col_has('MOLO')
+
+        def get(cells, i):
+            return cells[i] if 0 <= i < len(cells) else ""
+
         for row in re.findall(r'<tr[^>]*>(.*?)</tr>', row_wrap(t), re.S):
             cells = [re.sub(r'\s+', ' ', re.sub(r'<[^>]+>', ' ', c)).strip()
                      for c in re.findall(r'<td[^>]*>(.*?)</td>', row, re.S)]
-            if len(cells) < 3 or not re.match(r'^\d{1,2}:\d{2}$', cells[2]):
+            ora = get(cells, i_ora)
+            if not re.match(r'^\d{1,2}:\d{2}$', ora):
                 continue
-            # Colonne: ...ORA [ORA EFF] STATUS MOLO -> molo = ultima, stato = penultima
-            molo = cells[-1] if len(cells) >= 4 else ""
-            status = cells[-2] if len(cells) >= 4 else ""
+            port = get(cells, i_port)
             out.append({
-                "ship": cells[0], "port": cells[1], "time": cells[2], "dir": direction,
-                "harbor": harbor, "status": status, "molo": molo, "locode": _locode(cells[1]),
+                "ship": get(cells, i_ship), "port": port, "time": ora, "dir": direction,
+                "harbor": harbor, "status": get(cells, i_status), "motivo": get(cells, i_motivo),
+                "eff": get(cells, i_eff), "molo": get(cells, i_molo), "locode": _locode(port),
             })
     return out
 
@@ -666,6 +694,17 @@ def _compute_ferries():
         h, m = f["time"].split(":")
         return int(h) * 60 + int(m)
 
+    # Una nave e' "arrivata" se il suo arrivo ha l'orario effettivo popolato o
+    # uno stato di sbarco/ormeggio. Serve per la partenza: se la nave che deve
+    # partire non e' ancora arrivata -> stato "NON ARRIVATA" invece di "FERMA".
+    arrival_arrived = {}   # (harbor, ship) -> bool
+    for f in allf:
+        if f["dir"] == 'ARR':
+            key = (f["harbor"], f["ship"])
+            st = f["status"].lower()
+            arr = bool(f["eff"].strip()) or any(w in st for w in ('sbarco', 'ormeggi', 'arrivat', 'attracc'))
+            arrival_arrived[key] = arrival_arrived.get(key, False) or arr
+
     shown = []
     for f in allf:
         tm = tmin(f)
@@ -678,7 +717,21 @@ def _compute_ferries():
             continue
         if now_min - tm > 120:            # oltre 2h nel passato: scarta comunque
             continue
-        shown.append({k: f[k] for k in ("ship", "port", "time", "dir", "harbor", "molo", "status", "locode")})
+
+        # Testo di fallback quando lo STATUS e' vuoto.
+        if f["dir"] == 'ARR':
+            fallback = "IN ARRIVO"
+        else:
+            key = (f["harbor"], f["ship"])
+            if key in arrival_arrived and not arrival_arrived[key]:
+                fallback = "NON ARRIVATA"     # deve ancora arrivare per poter ripartire
+            else:
+                fallback = "FERMA"
+
+        rec = {k: f[k] for k in ("ship", "port", "time", "dir", "harbor", "molo",
+                                 "status", "motivo", "eff", "locode")}
+        rec["fallback"] = fallback
+        shown.append(rec)
     shown.sort(key=tmin)
     return shown
 
