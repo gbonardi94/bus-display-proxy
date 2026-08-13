@@ -598,6 +598,7 @@ FERRY_SOURCES = [
 FERRY_REFRESH = 180      # secondi (3 min)
 _ferries_cache = []
 _ferries_lock = threading.Lock()
+_departed_seen = {}      # (harbor, ship, time) -> epoch del primo stato "Partito"
 
 # LOCODE UN/LOCODE (3 char finali, senza il paese) dei porti collegati.
 LOCODE = {
@@ -736,14 +737,31 @@ def _compute_ferries():
         if f["dir"] == 'DEP' and not arrival_done.get((f["harbor"], f["ship"]), False):
             continue
 
-        fallback = "IN ARRIVO" if f["dir"] == 'ARR' else "FERMA"
+        # Fallback (stato vuoto): arrivo previsto lontano (>30 min) -> "~~~~~~"
+        # (nave in navigazione), altrimenti "IN ARRIVO".
+        if f["dir"] == 'ARR':
+            fallback = "~~~~~~" if (tm - now_min) > 30 else "IN ARRIVO"
+        else:
+            fallback = "FERMA"
+
+        # Stato visualizzato: dopo 15 min dal primo "Partito" -> "Salpata".
+        if f["dir"] == 'DEP' and 'partit' in st:
+            key = (f["harbor"], f["ship"], f["time"])
+            first = _departed_seen.setdefault(key, time.time())
+            disp_status = "Salpata" if (time.time() - first) >= 900 else "Partita"
+        else:
+            disp_status = _status_display(f["status"])
 
         rec = {k: f[k] for k in ("ship", "port", "time", "dir", "harbor", "molo",
                                  "status", "motivo", "eff", "locode")}
-        rec["status"] = _status_display(f["status"])
+        rec["status"] = disp_status
         rec["fallback"] = fallback
         shown.append(rec)
     shown.sort(key=tmin)
+
+    cutoff = time.time() - 3 * 3600      # pota il tracker "Partito" oltre le 3h
+    for k in [k for k, v in _departed_seen.items() if v < cutoff]:
+        del _departed_seen[k]
     return shown
 
 
