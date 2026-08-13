@@ -617,14 +617,17 @@ def _locode(port):
 
 
 def _status_display(s):
-    # Normalizza alcuni stati per il display: imbarco in corso -> Imbarco,
-    # imbarco terminato/chiuso -> Pronta. Gli altri passano invariati.
+    # Normalizza alcuni stati per il display. Gli altri passano invariati.
     sl = s.lower()
+    if 'ingresso veicoli' in sl:
+        return "Imbarco"
     if 'imbarco' in sl:
         if 'corso' in sl:
             return "Imbarco"
         if 'terminat' in sl or 'chius' in sl:
             return "Pronta"
+    if 'sbarco' in sl and 'corso' in sl:
+        return "Sbarco"
     return s
 
 
@@ -706,16 +709,15 @@ def _compute_ferries():
         h, m = f["time"].split(":")
         return int(h) * 60 + int(m)
 
-    # Una nave e' "arrivata" se il suo arrivo ha l'orario effettivo popolato o
-    # uno stato di sbarco/ormeggio. Serve per la partenza: se la nave che deve
-    # partire non e' ancora arrivata -> stato "NON ARRIVATA" invece di "FERMA".
-    arrival_arrived = {}   # (harbor, ship) -> bool
+    # La partenza di una nave si mostra SOLO quando il suo arrivo ha stato
+    # "Sbarco terminato" (finche' non ha finito lo sbarco, non puo' ripartire).
+    arrival_done = {}   # (harbor, ship) -> sbarco terminato visto
     for f in allf:
         if f["dir"] == 'ARR':
             key = (f["harbor"], f["ship"])
             st = f["status"].lower()
-            arr = bool(f["eff"].strip()) or any(w in st for w in ('sbarco', 'ormeggi', 'arrivat', 'attracc'))
-            arrival_arrived[key] = arrival_arrived.get(key, False) or arr
+            done = 'sbarco' in st and ('terminat' in st or 'complet' in st)
+            arrival_done[key] = arrival_done.get(key, False) or done
 
     shown = []
     for f in allf:
@@ -730,11 +732,9 @@ def _compute_ferries():
         if now_min - tm > 120:            # oltre 2h nel passato: scarta comunque
             continue
 
-        # Partenza di una nave che non e' ancora arrivata: non la mostriamo.
-        if f["dir"] == 'DEP':
-            key = (f["harbor"], f["ship"])
-            if key in arrival_arrived and not arrival_arrived[key]:
-                continue
+        # Partenza mostrata solo se l'arrivo della nave e' a "Sbarco terminato".
+        if f["dir"] == 'DEP' and not arrival_done.get((f["harbor"], f["ship"]), False):
+            continue
 
         fallback = "IN ARRIVO" if f["dir"] == 'ARR' else "FERMA"
 
